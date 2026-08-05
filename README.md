@@ -13,6 +13,10 @@ you write linear code using `Must*` inside a `Scope*` block. Errors are still
 values at the block boundary — `Scope` recovers `Must`-induced panics and
 returns them as ordinary errors.
 
+When a fallible call needs local context before it bubbles out, wrap the result
+with `Of*`, call `Wrap`, `Wrapf`, or `MapErr`, then finish with either `Must`
+inside a `Scope` or `Result` at a normal Go return boundary.
+
 ## Why
 
 Go's explicit error handling is great for readability at function boundaries,
@@ -85,6 +89,16 @@ var ce *customErr
 errors.As(err, &ce)                    // true if ErrEmpty wraps a *customErr
 ```
 
+`Of*` wrappers preserve the same identity when adding context:
+
+```go
+_, err := try.Scope1(func() int {
+    return try.Of1(parse(input)).Wrap("parse input").Must()
+})
+
+errors.Is(err, ErrEmpty)               // true
+```
+
 ### Nested Scope
 
 `Scope` blocks may be nested. The innermost `Scope` recovers a `Must` panic
@@ -111,7 +125,8 @@ err := try.Scope(func() {
 - **Don't inspect outputs when `err != nil`.** They are zero values, not
   partial results.
 - **Foreign panics are not converted.** A nil dereference or a panic from a
-  third-party library inside `f` is re-panicked, not returned as `err`.
+  third-party library inside `f` is re-panicked with the original panic value,
+  not returned as `err`.
 
 ## API
 
@@ -132,6 +147,30 @@ func Must5[A, B, C, D, E any](v1 A, v2 B, v3 C, v4 D, v5 E, err error) (A, B, C,
 Outside a `Scope`, a `Must` panic propagates and crashes the program, similar
 to `template.Must`.
 
+### `Assert` — fail a precondition
+
+`Assert` and `Assertf` are for preconditions that should bubble out as errors
+from a `Scope`.
+
+```go
+var ErrEmpty = errors.New("empty input")
+
+err := try.Scope(func() {
+    try.Assert(input != "", ErrEmpty)
+    try.Assertf(limit > 0, "invalid limit %d", limit)
+})
+```
+
+```go
+func Assert(ok bool, err error)
+func Assertf(ok bool, format string, args ...any)
+var ErrAssertionFailed error
+```
+
+If `Assert` fails with a nil error, it uses `ErrAssertionFailed` so the failed
+assertion is not silently ignored. Outside a `Scope`, failed assertions panic
+like `Must`.
+
 ### `Scope` — convert `Must` panics back to errors
 
 `Scope` runs `f` and returns any `Must`-induced panic as an `err`.
@@ -148,6 +187,55 @@ func Scope5[A, B, C, D, E any](f func() (A, B, C, D, E)) (out1 A, out2 B, out3 C
 
 If a non-`Must` panic occurs inside `f`, `Scope` re-panics with the original
 value so genuine bugs surface normally.
+
+Go does not have Python-style bare re-raise. The re-panic keeps the original
+panic value, but runtime output or outer recover middleware may show the
+`Scope` re-panic frame above the original business frames.
+
+### `Of` — add context before returning
+
+`Of`/`Of1`..`Of5` capture a normal Go result so the error can be wrapped or
+mapped before the final `Must` or `Result`.
+
+```go
+func Of(err error) Try
+func Of1[A any](v1 A, err error) Try1[A]
+func Of2[A, B any](v1 A, v2 B, err error) Try2[A, B]
+func Of3[A, B, C any](v1 A, v2 B, v3 C, err error) Try3[A, B, C]
+func Of4[A, B, C, D any](v1 A, v2 B, v3 C, v4 D, err error) Try4[A, B, C, D]
+func Of5[A, B, C, D, E any](v1 A, v2 B, v3 C, v4 D, v5 E, err error) Try5[A, B, C, D, E]
+```
+
+Each `Try*` value supports the same chainable methods:
+
+```go
+MapErr(func(error) error) Try*
+Wrap(message string) Try*
+Wrapf(format string, args ...any) Try*
+Must() values...
+Result() values..., error
+```
+
+`Wrap` and `Wrapf` add context while preserving the original error for
+`errors.Is` and `errors.As`. `MapErr` is for custom error types or policies.
+If `MapErr` returns nil for a non-nil error, the original error is kept so an
+existing failure is not swallowed accidentally.
+
+Use `Must` inside `Scope` when you want linear control flow. Use `Result` when
+you are already at a normal Go return boundary.
+
+```go
+return try.Scope1(func() int {
+    cfg := try.Of1(readConfig(path)).Wrapf("read config %q", path).Must()
+    return try.Of1(parseConfig(cfg)).Wrap("parse config").Must()
+})
+```
+
+```go
+func load(path string) (Config, error) {
+    return try.Of1(readConfig(path)).Wrapf("read config %q", path).Result()
+}
+```
 
 ## Usage
 
@@ -171,19 +259,17 @@ func parse(s string) (int, error) {
 }
 
 func double(s string) (int, error) {
-    n := try.Must1(parse(s)) // panics on ErrEmpty
-    return n * 2, nil
+    return try.Scope1(func() int {
+        n := try.Must1(parse(s)) // converted to err by Scope1
+        return n * 2
+    })
 }
 
 func main() {
-    out, err := try.Scope1(func() int {
-        return try.Must1(double("hello"))
-    })
+    out, err := double("hello")
     fmt.Println(out, err) // 10 <nil>
 
-    _, err = try.Scope1(func() int {
-        return try.Must1(double(""))
-    })
+    _, err = double("")
     fmt.Println(errors.Is(err, ErrEmpty)) // true
 }
 ```
@@ -191,7 +277,7 @@ func main() {
 ## When to use
 
 - **Good fit:** short, linear setup or transformation pipelines where the only
-  recovery strategy is "bubble the error up unchanged".
+  recovery strategy is "bubble the error up", optionally with local context.
 - **Not a good fit:** request handlers that need to map errors to status codes,
   retry loops, or any path where you actually branch on specific errors —
   plain `if err != nil` is clearer there.
