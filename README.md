@@ -237,6 +237,57 @@ func load(path string) (Config, error) {
 }
 ```
 
+### `tryerr` — structured error metadata
+
+The `tryerr` subpackage adds stable codes, structured attributes, and a
+backtrace while keeping Go's native error chain intact.
+
+```go
+return try.Of1(readConfig(path)).
+    MapErr(func(err error) error {
+        return tryerr.Wrap(
+            err,
+            "read config",
+            tryerr.WithCode(1001),
+            tryerr.WithAttr("path", path),
+        )
+    }).
+    Result()
+```
+
+`tryerr.Wrap(nil, ...)` returns nil, so it is safe to use in ordinary
+propagation paths. The default code is `-1`; override it with
+`tryerr.WithCode`. Code `0` is reserved for unset values and is skipped by
+`tryerr.Code`. `tryerr.WithAttrs` copies its input map, and `tryerr.Attrs`
+returns a fresh merged map where outer errors keep precedence on key collisions.
+
+```go
+func New(message string, opts ...Option) error
+func Wrap(cause error, message string, opts ...Option) error
+func WithCode(code int) Option
+func WithAttr(key, value string) Option
+func WithAttrs(attrs map[string]string) Option
+func WithStackDepth(depth int) Option
+func WithStackSkip(skip int) Option
+func Code(err error) int
+func Attrs(err error) map[string]string
+func StackFrames(err error) iter.Seq[runtime.Frame]
+```
+
+Use `errors.Is` / `errors.As` for the original cause and `tryerr.Code`,
+`tryerr.Attrs`, or `tryerr.StackFrames` for structured metadata.
+`StackFrames` returns `iter.Seq[runtime.Frame]`, so callers can range over
+resolved frames without handling raw program counters. `New` and `Wrap` capture
+one caller frame by default; use `tryerr.WithStackDepth` to capture more and
+`tryerr.WithStackSkip` to skip additional caller frames. Stack skip is relative
+to the caller of `New` or `Wrap`. `Error()` includes the code and first captured
+frame in the returned text, for example `read config [code=1001] [...]`.
+
+The extractor functions primarily read `tryerr.Error` values. They also accept
+small same-shape providers in the chain: `interface{ Code() int }`,
+`interface{ Attrs() map[string]string }`, and
+`interface{ StackFrames() iter.Seq[runtime.Frame] }`.
+
 ## Usage
 
 ```go
@@ -284,7 +335,7 @@ func main() {
 
 ## Compatibility
 
-Requires Go 1.18+ (generics).
+Requires Go 1.24+.
 
 ## License
 
